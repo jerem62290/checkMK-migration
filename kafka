@@ -1,0 +1,166 @@
+Seules 2 lignes changent d’une machine à l’autre :
+
+Machine	node.id	advertised.listeners
+mcq-dbk70	1	BROKER://mcq-dbk70.cgi.credit-cgi.fr:9092
+mcq-dbk71	2	BROKER://mcq-dbk71.cgi.credit-cgi.fr:9092
+mcq-dbk72	3	BROKER://mcq-dbk72.cgi.credit-cgi.fr:9092
+cat > /etc/kafka/server.properties <<'EOF'
+############ Identité KRaft ############
+process.roles=broker,controller
+node.id=1
+controller.quorum.voters=1@mcq-dbk70.cgi.credit-cgi.fr:9093,2@mcq-dbk71.cgi.credit-cgi.fr:9093,3@mcq-dbk72.cgi.credit-cgi.fr:9093
+
+############ Listeners ############
+listeners=BROKER://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+advertised.listeners=BROKER://mcq-dbk70.cgi.credit-cgi.fr:9092
+listener.security.protocol.map=BROKER:SASL_PLAINTEXT,CONTROLLER:SASL_PLAINTEXT
+inter.broker.listener.name=BROKER
+controller.listener.names=CONTROLLER
+
+############ SASL ############
+sasl.mechanism.inter.broker.protocol=SCRAM-SHA-512
+sasl.mechanism.controller.protocol=PLAIN
+listener.name.broker.sasl.enabled.mechanisms=SCRAM-SHA-512
+listener.name.controller.sasl.enabled.mechanisms=PLAIN
+listener.name.broker.scram-sha-512.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="admin" password="<ADMIN_PW>";
+listener.name.controller.plain.sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="<ADMIN_PW>" user_admin="<ADMIN_PW>";
+
+############ Autorisations ############
+authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+super.users=User:admin
+allow.everyone.if.no.acl.found=false
+
+############ Stockage ############
+log.dirs=/inte/vq/DAT/data/KFK/data
+
+############ Durabilité / valeurs par défaut des topics ############
+default.replication.factor=3
+min.insync.replicas=2
+num.partitions=3
+offsets.topic.replication.factor=3
+transaction.state.log.replication.factor=3
+transaction.state.log.min.isr=2
+unclean.leader.election.enable=false
+auto.create.topics.enable=false
+
+############ Rétention (révisable quand on aura les volumes) ############
+log.retention.hours=168
+log.segment.bytes=536870912
+
+############ Divers ############
+group.initial.rebalance.delay.ms=3000
+EOF
+
+Puis remplacez les valeurs propres à la machine et le mot de passe, et protégez le fichier. Adaptez NODE= et HOST= sur chaque broker :
+
+NODE=1; HOST=mcq-dbk70; sed -i "s/^node.id=.*/node.id=$NODE/; s#^advertised.listeners=.*#advertised.listeners=BROKER://$HOST.cgi.credit-cgi.fr:9092#" /etc/kafka/server.properties
+read -rsp 'ADMIN_PW: ' PW; echo; sed -i "s#<ADMIN_PW>#$PW#g" /etc/kafka/server.properties; unset PW
+chown root:kafka /etc/kafka/server.properties && chmod 640 /etc/kafka/server.properties && grep -c '<ADMIN_PW>' /etc/kafka/server.properties
+
+➡️ Le dernier grep doit afficher 0, ce qui confirme qu’il ne reste plus aucun marqueur à remplacer. Si votre mot de passe contient #, & ou \, dites-le-moi : la commande sed devra être adaptée.
+
+Logs applicatifs
+
+cp /opt/kafka/current/config/log4j.properties /etc/kafka/log4j.properties && chown root:kafka /etc/kafka/log4j.properties && chmod 644 /etc/kafka/log4j.properties
+2.3 Formater le stockage (sur chaque broker, avec le même CLUSTER_ID)
+
+L’option --add-scram crée le compte SCRAM admin dès le formatage. Sans lui, les brokers ne pourraient pas s’authentifier entre eux au premier démarrage, puisqu’aucun compte n’existerait encore dans les métadonnées.
+
+read -rsp 'ADMIN_PW: ' PW; echo; sudo -u kafka JAVA_HOME=/usr/lib/jvm/jre-21-openjdk LOG_DIR=/var/log/kafka /opt/kafka/current/bin/kafka-storage.sh format -t <CLUSTER_ID> -c /etc/kafka/server.properties --add-scram "SCRAM-SHA-512=[name=admin,password=$PW]"; unset PW
+
+➡️ Résultat attendu : Formatting metadata directory /inte/vq/DAT/data/KFK/data with metadata.version 3.9-IV0.
+
+2.4 Unit systemd (sur chaque broker)
+cat > /etc/systemd/system/kafka.service <<'EOF'
+[Unit]
+Description=Apache Kafka (KRaft broker+controller)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=kafka
+Group=kafka
+Environment=JAVA_HOME=/usr/lib/jvm/jre-21-openjdk
+Environment="KAFKA_HEAP_OPTS=-Xms6g -Xmx6g"
+Environment=LOG_DIR=/var/log/kafka
+Environment="KAFKA_LOG4J_OPTS=-Dlog4j.configuration=file:/etc/kafka/log4j.properties"
+ExecStart=/opt/kafka/current/bin/kafka-server-start.sh /etc/kafka/server.properties
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=180
+SuccessExitStatus=143
+LimitNOFILE=200000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable kafka
+2.5 Démarrer les 3 brokers
+
+Lancez-les à quelques secondes d’intervalle. Le quorum KRaft a besoin de 2 controllers sur 3 pour élire un leader.
+
+systemctl start kafka
+systemctl is-active kafka; ss -ltn | grep -E ':909[23]'; grep -iE 'ERROR|Kafka Server started' /var/log/kafka/server.log | tail -5
+ausearch -m avc -ts recent | grep -c denied
+
+➡️ Résultats attendus sur chaque broker :
+
+active ;
+les ports 9092 et 9093 en écoute ;
+une ligne Kafka Server started ;
+0 refus SELinux.
+2.6 Vérifier depuis la toolbox mcq-dbt70
+
+Fichier d’administration, lisible par root uniquement :
+
+read -rsp 'ADMIN_PW: ' PW; echo; umask 077; cat > /root/kafka-admin.properties <<EOF
+bootstrap.servers=mcq-dbk70.cgi.credit-cgi.fr:9092,mcq-dbk71.cgi.credit-cgi.fr:9092,mcq-dbk72.cgi.credit-cgi.fr:9092
+security.protocol=SASL_PLAINTEXT
+sasl.mechanism=SCRAM-SHA-512
+sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="admin" password="$PW";
+EOF
+unset PW
+export JAVA_HOME=/usr/lib/jvm/jre-21-openjdk K=/opt/kafka/current/bin BS=mcq-dbk70.cgi.credit-cgi.fr:9092
+
+Test 1 : état du quorum
+
+$K/kafka-metadata-quorum.sh --bootstrap-server $BS --command-config /root/kafka-admin.properties describe --status | grep -E 'LeaderId|CurrentVoters|MaxFollowerLag'
+
+Test 2 : création d’un topic de test
+
+$K/kafka-topics.sh --bootstrap-server $BS --command-config /root/kafka-admin.properties --create --topic test.install --partitions 3 --replication-factor 3 && $K/kafka-topics.sh --bootstrap-server $BS --command-config /root/kafka-admin.properties --describe --topic test.install
+
+Test 3 : un client sans authentification doit être refusé
+
+timeout 20 $K/kafka-topics.sh --bootstrap-server $BS --list; echo "rc=$?"
+✅ Ce que j’attends en retour
+Le contexte SELinux du script après correction de la règle pour 3.9.1 : bin_t ?
+Le résultat de 2.3 : le formatage est-il OK sur les 3 brokers ?
+Le résultat de 2.5 : active, les 2 ports en écoute, started dans les logs, 0 refus SELinux, sur les 3 brokers ?
+Test 1 : la valeur de LeaderId, la liste CurrentVoters (attendu [1,2,3]) et MaxFollowerLag (attendu 0 ou proche de 0).
+Test 2 : la colonne Isr affiche-t-elle 3 brokers pour chaque partition ?
+Test 3 : la commande échoue-t-elle bien (timeout ou erreur, rc différent de 0) ?
+
+En cas d’erreur, donnez-moi la première ligne ERROR ou Caused by de /var/log/kafka/server.log.
+
+Une fois ces tests validés, l’étape 3 portera sur les comptes SCRAM applicatifs, les ACLs, et la préparation des topics internes de Kafka Connect.
+
+Pourquoi je genere les secrets notamment l'id du cluster sur la toolbox?
+
+Il n’y a aucune raison technique. C’était un choix de commodité, et vous pouvez générer ces deux valeurs sur n’importe laquelle des machines où Kafka est installé, par exemple mcq-dbk70.
+
+Ce que sont ces deux valeurs
+L’ID du cluster est un simple UUID aléatoire, que kafka-storage.sh random-uuid affiche sous une forme courte de 22 caractères. Il n’est lié à aucune machine et n’est pas un secret : il sert seulement d’identifiant au cluster. La seule règle est de le générer une seule fois et d’utiliser la même valeur au formatage des 3 brokers. Si deux brokers sont formatés avec des ID différents, ils refusent de former un cluster.
+Le mot de passe admin est une chaîne aléatoire. openssl rand fonctionne partout, et si votre coffre de mots de passe a un générateur, utilisez-le plutôt.
+Pourquoi j’avais proposé la toolbox
+C’est la machine d’administration : c’est là qu’on crée /root/kafka-admin.properties, qui contient le mot de passe admin. Je voulais regrouper au même endroit les opérations sur les secrets.
+Les commandes Kafka et Java 21 y sont déjà installées.
+Version simplifiée, à lancer sur mcq-dbk70
+
+Ma commande précédente contenait aussi un java -version inutile. Voici les deux commandes nettoyées :
+
+JAVA_HOME=/usr/lib/jvm/jre-21-openjdk /opt/kafka/current/bin/kafka-storage.sh random-uuid
+openssl rand -base64 24
+
+Notez les deux résultats dans votre coffre, puis reprenez l’étape 2 à partir de 2.2.
