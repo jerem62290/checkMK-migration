@@ -1,0 +1,182 @@
+Étape 7 : Temurin 25 et AKHQ 0.28.0 sur mcq-dbt70
+
+On fait d’abord l’étape 7. Je vous donne l’étape 8 (monitoring) dès que vous m’aurez fait votre retour sur celle-ci.
+
+Organisation retenue
+Élément	Emplacement
+JRE Temurin 25	/opt/java/jdk-25.0.4.1+1-jre, avec le lien /opt/java/temurin-25. Le Java du système n’est pas modifié.
+AKHQ	/opt/akhq/akhq-0.28.0-all.jar, avec le lien /opt/akhq/akhq.jar
+Configuration	/etc/akhq/application.yml
+Compte de service	akhq
+Interface web	port 8080, ouvert à tous les réseaux, avec authentification
+Santé et métriques Prometheus	port 28081 (/health, /prometheus). On l’utilisera à l’étape 8.
+Logs	journald, consultables avec journalctl -u akhq
+7.1 Installer Temurin 25
+
+Vérifiez d’abord le nom du répertoire contenu dans l’archive :
+
+tar -tzf /opt/bundle/artifacts/toolbox/OpenJDK25U-jre_x64_linux_hotspot_25.0.4.1_1.tar.gz | head -1
+
+➡️ Résultat attendu : jdk-25.0.4.1+1-jre/. S’il est différent, adaptez les chemins ci-dessous.
+
+mkdir -p /opt/java && tar -xzf /opt/bundle/artifacts/toolbox/OpenJDK25U-jre_x64_linux_hotspot_25.0.4.1_1.tar.gz -C /opt/java && ln -sfn /opt/java/jdk-25.0.4.1+1-jre /opt/java/temurin-25
+
+On applique les droits explicitement (umask restrictif) et les contextes SELinux sur le vrai répertoire :
+
+chown -R root:root /opt/java && chmod 755 /opt/java && chmod -R u=rwX,go=rX /opt/java/jdk-25.0.4.1+1-jre && chmod 755 /opt/java/jdk-25.0.4.1+1-jre/bin/*
+semanage fcontext -a -t bin_t '/opt/java/jdk-25.0.4.1\+1-jre/bin(/.*)?' && restorecon -Rv /opt/java/jdk-25.0.4.1+1-jre >/dev/null
+/opt/java/temurin-25/bin/java -version 2>&1 | head -1; ls -Z /opt/java/jdk-25.0.4.1+1-jre/bin/java
+
+➡️ Résultat attendu : openjdk version "25.0.4.1" et un contexte bin_t.
+
+Le \+ dans la règle semanage est indispensable : la règle est une expression régulière, où + a un sens particulier.
+
+7.2 Compte de service et jar AKHQ
+useradd -r -M -d /opt/akhq -s /sbin/nologin akhq
+mkdir -p /opt/akhq /etc/akhq && cp /opt/bundle/artifacts/toolbox/akhq-0.28.0-all.jar /opt/akhq/ && ln -sfn /opt/akhq/akhq-0.28.0-all.jar /opt/akhq/akhq.jar
+chown -R root:root /opt/akhq && chmod 755 /opt/akhq && chmod 644 /opt/akhq/akhq-0.28.0-all.jar && chown root:akhq /etc/akhq && chmod 750 /etc/akhq && restorecon -R /opt/akhq /etc/akhq
+7.3 Préparer les secrets
+
+Vous en avez besoin de 5. Rangez-les dans votre coffre.
+
+Marqueur	Valeur	Comment l’obtenir
+<AKHQ_SCRAM_PW>	mot de passe Kafka du compte akhq	créé à l’étape 3.1
+<AKHQ_CONNECT_PW>	mot de passe REST akhq-connect	créé à l’étape 4.3
+<JWT_SECRET>	clé de signature des sessions web	openssl rand -hex 32
+<HASH_ADMIN>	empreinte SHA-256 du mot de passe de l’utilisateur web admin	commande ci-dessous
+<HASH_LECTEUR>	empreinte SHA-256 du mot de passe de l’utilisateur web lecteur	commande ci-dessous
+
+Pour calculer les deux empreintes, choisissez d’abord les deux mots de passe web (par exemple avec openssl rand -base64 18), puis :
+
+read -rsp 'Mot de passe web admin : ' P; echo; echo -n "$P" | sha256sum | cut -d' ' -f1; unset P
+read -rsp 'Mot de passe web lecteur : ' P; echo; echo -n "$P" | sha256sum | cut -d' ' -f1; unset P
+
+Le -n est important : sans lui, le retour à la ligne serait inclus dans l’empreinte et la connexion échouerait.
+
+7.4 Fichier /etc/akhq/application.yml
+cat > /etc/akhq/application.yml <<'EOF'
+micronaut:
+  server:
+    port: 8080
+  security:
+    enabled: true
+    token:
+      jwt:
+        signatures:
+          secret:
+            generator:
+              secret: "<JWT_SECRET>"
+  metrics:
+    enabled: true
+    export:
+      prometheus:
+        enabled: true
+        step: PT1M
+        descriptions: true
+
+endpoints:
+  all:
+    port: 28081
+    enabled: false
+  health:
+    enabled: true
+    sensitive: false
+  prometheus:
+    enabled: true
+    sensitive: false
+
+akhq:
+  connections:
+    cdc:
+      properties:
+        bootstrap.servers: "mcq-dbk70.cgi.credit-cgi.fr:9092,mcq-dbk71.cgi.credit-cgi.fr:9092,mcq-dbk72.cgi.credit-cgi.fr:9092"
+        security.protocol: SASL_PLAINTEXT
+        sasl.mechanism: SCRAM-SHA-512
+        sasl.jaas.config: 'org.apache.kafka.common.security.scram.ScramLoginModule required username="akhq" password="<AKHQ_SCRAM_PW>";'
+      connect:
+        - name: connect-cdc
+          url: "http://mcq-dbz70.cgi.credit-cgi.fr:8083"
+          basic-auth-username: akhq-connect
+          basic-auth-password: "<AKHQ_CONNECT_PW>"
+
+  security:
+    default-group: no-roles
+    roles:
+      reader:
+        - resources: [ "TOPIC", "TOPIC_DATA", "CONSUMER_GROUP", "CONNECT_CLUSTER", "CONNECTOR", "NODE", "ACL" ]
+          actions: [ "READ", "READ_CONFIG" ]
+      admin:
+        - resources: [ "TOPIC", "TOPIC_DATA" ]
+          actions: [ "READ", "CREATE", "UPDATE", "DELETE", "READ_CONFIG", "ALTER_CONFIG" ]
+        - resources: [ "CONSUMER_GROUP" ]
+          actions: [ "READ", "DELETE", "UPDATE_OFFSET", "DELETE_OFFSET" ]
+        - resources: [ "CONNECT_CLUSTER", "CONNECTOR" ]
+          actions: [ "READ", "CREATE", "UPDATE", "DELETE", "UPDATE_STATE" ]
+        - resources: [ "NODE" ]
+          actions: [ "READ", "READ_CONFIG", "ALTER_CONFIG" ]
+        - resources: [ "ACL" ]
+          actions: [ "READ" ]
+    groups:
+      admin:
+        - role: admin
+      reader:
+        - role: reader
+      no-roles: []
+    basic-auth:
+      - username: admin
+        password: "<HASH_ADMIN>"
+        passwordHash: SHA256
+        groups: [ "admin" ]
+      - username: lecteur
+        password: "<HASH_LECTEUR>"
+        passwordHash: SHA256
+        groups: [ "reader" ]
+EOF
+
+Remplacez les 5 marqueurs. Chaque commande vous demande la valeur sans l’afficher :
+
+for m in JWT_SECRET AKHQ_SCRAM_PW AKHQ_CONNECT_PW HASH_ADMIN HASH_LECTEUR; do read -rsp "$m : " V; echo; sed -i "s#<$m>#$V#g" /etc/akhq/application.yml; done; unset V
+chown root:akhq /etc/akhq/application.yml && chmod 640 /etc/akhq/application.yml && grep -cE '<(JWT_SECRET|AKHQ_SCRAM_PW|AKHQ_CONNECT_PW|HASH_ADMIN|HASH_LECTEUR)>' /etc/akhq/application.yml
+
+➡️ Le dernier grep doit afficher 0.
+
+⚠️ Si le mot de passe SCRAM d’akhq contient une apostrophe ' ou des guillemets ", la ligne sasl.jaas.config sera invalide. Avec openssl rand -base64, ce n’est jamais le cas. Les caractères #, & et \ posent aussi problème à la commande sed.
+
+7.5 Unit systemd
+cat > /etc/systemd/system/akhq.service <<'EOF'
+[Unit]
+Description=AKHQ - Kafka GUI
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=akhq
+Group=akhq
+WorkingDirectory=/opt/akhq
+ExecStart=/opt/java/temurin-25/bin/java -Xms512m -Xmx1g -Dmicronaut.config.files=/etc/akhq/application.yml -jar /opt/akhq/akhq.jar
+Restart=on-failure
+RestartSec=10
+SuccessExitStatus=143
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now akhq
+7.6 Vérifications
+
+Sur dbt70 (le démarrage prend environ 20 secondes) :
+
+systemctl is-active akhq; ss -ltn | grep -E ':8080|:28081'; ausearch -m avc -ts recent | grep -c denied
+journalctl -u akhq -n 50 --no-pager | grep -E 'ERROR|Startup completed' | tail -5
+curl -s http://localhost:28081/health; echo; curl -s http://localhost:28081/prometheus | head -3
+
+Depuis votre poste, dans un navigateur : http://mcq-dbt70.cgi.credit-cgi.fr:8080
+
+Test	Compte	Résultat attendu
+1	aucun	page de connexion
+2	admin	Nodes affiche 3 brokers. Topics montre connect-cdc-*. Connect affiche connect-cdc avec les plugins Debezium. ACLS liste les ACLs de l’étape 3.
+3	admin	créer un topic test.akhq : OK, puis le supprimer : OK
+4	admin	supprimer connect-cdc-offsets : refusé, grâce à l’ACL DENY de l’étape 3.5. Le refus apparaît comme une erreur d’autorisation venant de Kafka.
+5	lecteur	consultation possible, mais aucun bouton de création ni de suppression
