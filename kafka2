@@ -1,0 +1,97 @@
+Étape 3 : comptes SCRAM, ACLs et topics internes de Kafka Connect
+
+Tout se passe sur la toolbox mcq-dbt70, en root, avec /root/kafka-admin.properties.
+
+Proposition de comptes et de conventions de nommage
+Compte (principal)	Utilisé par	Droits
+admin	déjà créé : brokers et administration	super-utilisateur
+connect	les 2 workers Connect et les connecteurs Debezium	écriture sur les topics cdc.*, ses topics internes, ses groupes
+akhq	AKHQ	lecture seule : topics, messages, groupes, configs, ACLs
+kexporter	kafka_exporter	description des topics et des groupes
+app-<nom>	chaque consommateur applicatif, créé à l’étape 6	lecture de ses topics et de ses groupes
+Ressource	Nom proposé
+Groupe du cluster Connect	connect-cdc
+Topics internes de Connect	connect-cdc-configs, connect-cdc-offsets, connect-cdc-status
+Topics de données Debezium	cdc.<techno>.<source>.<schéma>.<table>, par exemple cdc.ora.FACT.SCH1.CLIENT
+Historique de schéma Oracle	cdc.schemahistory.<connecteur>
+Topics heartbeat Debezium	__debezium-heartbeat.cdc.*
+
+Le préfixe cdc. permet de couvrir tout Debezium avec une seule ACL préfixée, sans en ajouter à chaque nouveau connecteur. Si vous avez déjà une convention de nommage côté GoldenGate et que vous voulez la conserver pour les consommateurs, dites-le-moi avant d’appliquer.
+
+3.0 Préparer la session
+export JAVA_HOME=/usr/lib/jvm/jre-21-openjdk K=/opt/kafka/current/bin BS=mcq-dbk70.cgi.credit-cgi.fr:9092
+ADM="--bootstrap-server $BS --command-config /root/kafka-admin.properties"
+
+Supprimez le topic de test de l’étape 2 :
+
+$K/kafka-topics.sh $ADM --delete --topic test.install
+3.1 Créer les comptes SCRAM
+
+Générez un mot de passe par compte et rangez-les dans votre coffre :
+
+for u in connect akhq kexporter; do echo "$u : $(openssl rand -base64 24)"; done
+
+Créez ensuite chaque compte. La commande vous demande le mot de passe, qui n’apparaît donc pas dans l’historique du shell :
+
+for u in connect akhq kexporter; do read -rsp "Mot de passe $u : " PW; echo; $K/kafka-configs.sh $ADM --alter --entity-type users --entity-name $u --add-config "SCRAM-SHA-512=[iterations=8192,password=$PW]"; done; unset PW
+
+Vérifiez :
+
+$K/kafka-configs.sh $ADM --describe --entity-type users
+
+➡️ Résultat attendu : 4 utilisateurs (admin, connect, akhq, kexporter), chacun avec SCRAM-SHA-512.
+
+3.2 Créer les topics internes de Kafka Connect
+
+On les crée nous-mêmes plutôt que de laisser Connect s’en charger. On garantit ainsi un facteur de réplication de 3, la compaction et le bon nombre de partitions :
+
+$K/kafka-topics.sh $ADM --create --topic connect-cdc-configs --partitions 1  --replication-factor 3 --config cleanup.policy=compact
+$K/kafka-topics.sh $ADM --create --topic connect-cdc-offsets --partitions 25 --replication-factor 3 --config cleanup.policy=compact
+$K/kafka-topics.sh $ADM --create --topic connect-cdc-status  --partitions 5  --replication-factor 3 --config cleanup.policy=compact
+
+⚠️ Le topic connect-cdc-configs doit avoir exactement 1 partition, sinon les workers refusent de démarrer. Le topic des offsets contient la position de lecture de chaque connecteur dans les bases (LSN PostgreSQL, SCN Oracle). Il ne faut jamais le supprimer.
+
+3.3 Définir les ACLs
+
+Compte connect (workers et Debezium) :
+
+for p in connect-cdc- cdc. __debezium-heartbeat; do $K/kafka-acls.sh $ADM --add --allow-principal User:connect --operation Read --operation Write --operation Create --operation Describe --operation DescribeConfigs --topic "$p" --resource-pattern-type prefixed; done
+for g in connect-cdc cdc.; do $K/kafka-acls.sh $ADM --add --allow-principal User:connect --operation Read --operation Describe --group "$g" --resource-pattern-type prefixed; done
+
+Compte akhq (lecture seule) :
+
+$K/kafka-acls.sh $ADM --add --allow-principal User:akhq --operation Read --operation Describe --operation DescribeConfigs --topic '*'
+$K/kafka-acls.sh $ADM --add --allow-principal User:akhq --operation Read --operation Describe --group '*'
+$K/kafka-acls.sh $ADM --add --allow-principal User:akhq --operation Describe --operation DescribeConfigs --cluster
+
+Compte kexporter :
+
+$K/kafka-acls.sh $ADM --add --allow-principal User:kexporter --operation Describe --topic '*'
+$K/kafka-acls.sh $ADM --add --allow-principal User:kexporter --operation Describe --group '*'
+
+Vérifiez la liste complète :
+
+$K/kafka-acls.sh $ADM --list | grep -c 'principal=User'
+3.4 Tester les droits avec le compte connect
+read -rsp 'PW connect: ' PW; echo; umask 077; cat > /root/test-connect.properties <<EOF
+security.protocol=SASL_PLAINTEXT
+sasl.mechanism=SCRAM-SHA-512
+sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="connect" password="$PW";
+EOF
+unset PW; TC="--bootstrap-server $BS --command-config /root/test-connect.properties"
+
+Test A : création autorisée (le préfixe cdc. est couvert par une ACL)
+
+$K/kafka-topics.sh $TC --create --topic cdc.test.acl --partitions 1 --replication-factor 3
+
+Test B : création refusée (hors préfixe)
+
+$K/kafka-topics.sh $TC --create --topic hors.prefixe --partitions 1 --replication-factor 3
+
+Test C : visibilité limitée (le compte ne voit que ses topics)
+
+$K/kafka-topics.sh $TC --list
+
+Nettoyage
+
+$K/kafka-topics.sh $ADM --delete --topic cdc.test.acl && rm -f /root/test-connect.properties
