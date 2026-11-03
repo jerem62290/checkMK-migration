@@ -1,0 +1,185 @@
+Étape 3 (fin) et étape 4 : Kafka Connect
+3.5 Droits d’administration pour AKHQ (sur la toolbox)
+
+Vous n’avez pas mentionné les tests A, B et C de l’étape 3.4. Confirmez-moi qu’ils donnent bien A réussi, B refusé et C limité aux topics du compte.
+
+Les commandes ci-dessous reprennent les variables de la session 3.0. Si vous avez ouvert un nouveau shell, ré-exportez JAVA_HOME, K, BS et ADM avant de les lancer.
+
+Droits ajoutés à akhq : créer, modifier et supprimer des topics, produire des messages de test, supprimer des groupes et repositionner leurs offsets.
+
+$K/kafka-acls.sh $ADM --add --allow-principal User:akhq --operation Create --operation Delete --operation Alter --operation AlterConfigs --operation Write --topic '*'
+$K/kafka-acls.sh $ADM --add --allow-principal User:akhq --operation Delete --group '*'
+
+Garde-fous : une ACL DENY l’emporte toujours sur une ACL ALLOW. Avec les deux commandes suivantes, une fausse manipulation dans AKHQ ne pourra pas :
+
+supprimer les topics internes de Connect, qui contiennent les positions SCN/LSN des connecteurs ;
+supprimer l’historique de schéma Oracle ;
+injecter des messages dans les flux CDC.
+for p in connect-cdc- cdc.schemahistory.; do $K/kafka-acls.sh $ADM --add --deny-principal User:akhq --operation Delete --operation Alter --operation AlterConfigs --operation Write --topic "$p" --resource-pattern-type prefixed; done
+$K/kafka-acls.sh $ADM --add --deny-principal User:akhq --operation Write --topic cdc. --resource-pattern-type prefixed
+
+Avec cette dernière règle, AKHQ ne peut pas produire dans les topics cdc.*. Il peut en revanche toujours supprimer un topic de données cdc.ora.* ou cdc.pg.*. Si vous voulez bloquer aussi ces suppressions, dites-le-moi.
+
+Les deux profils côté interface, lecteur et administrateur, seront configurés à l’étape 7.
+
+⚠️ Point important sur les 2 comptes de l’API REST de Connect
+
+L’authentification intégrée à Kafka Connect (BasicAuthSecurityRestExtension) vérifie l’identité mais ne gère pas les rôles. Tout compte authentifié peut créer, modifier et supprimer des connecteurs. Un compte « lecture seule » n’est donc pas possible avec Connect seul.
+
+Option	Principe	Avantages / inconvénients
+A (recommandée)	Deux comptes REST : connect-admin pour les opérations manuelles et les scripts, akhq-connect comme compte technique d’AKHQ. La séparation lecture / écriture des exploitants passe par les rôles d’AKHQ, qui a une page Connect complète.	Simple, rien de plus à installer. Les accès directs en curl restent réservés aux administrateurs.
+B	En plus de A, un nginx (RPM de votre dépôt) devant chaque worker sur un port dédié, qui n’autorise que les requêtes GET pour un compte connect-viewer.	Vraie lecture seule sur l’API REST. En contrepartie, un composant de plus à maintenir, et le port 8083 reste ouvert pour les administrateurs.
+
+Je prépare l’option A ci-dessous. L’option B pourra s’ajouter plus tard sans rien défaire.
+
+Étape 4 : Kafka Connect distribué (mcq-dbz70 et mcq-dbz71)
+
+Toutes les commandes sont à lancer sur les deux workers, sauf mention contraire.
+
+4.1 Installer les plugins Debezium
+cd /opt/kafka/plugins && tar -xzf /opt/bundle/artifacts/debezium/debezium-connector-postgres-3.1.3.Final-plugin.tar.gz && tar -xzf /opt/bundle/artifacts/debezium/debezium-connector-oracle-3.1.3.Final-plugin.tar.gz
+
+Le plugin Oracle ne contient pas les pilotes JDBC Oracle (licence). On les ajoute dans son répertoire :
+
+cp /opt/bundle/artifacts/debezium/{ojdbc11-21.15.0.0.jar,xdb-21.15.0.0.jar,xmlparserv2-21.15.0.0.jar} /opt/kafka/plugins/debezium-connector-oracle/
+
+On applique les droits explicitement, à cause du umask restrictif rencontré à l’étape 2 :
+
+chown -R root:root /opt/kafka/plugins && chmod -R u=rwX,go=rX /opt/kafka/plugins && restorecon -R /opt/kafka/plugins
+ls /opt/kafka/plugins; ls /opt/kafka/plugins/debezium-connector-oracle | grep -E 'ojdbc|xdb|xmlparser'
+
+➡️ Résultat attendu : 2 répertoires debezium-connector-postgres et debezium-connector-oracle, et 3 jars Oracle.
+
+4.2 Configuration du worker : /etc/kafka/connect-distributed.properties
+
+Une seule ligne change d’un worker à l’autre : rest.advertised.host.name.
+
+cat > /etc/kafka/connect-distributed.properties <<'EOF'
+############ Cluster Kafka ############
+bootstrap.servers=mcq-dbk70.cgi.credit-cgi.fr:9092,mcq-dbk71.cgi.credit-cgi.fr:9092,mcq-dbk72.cgi.credit-cgi.fr:9092
+security.protocol=SASL_PLAINTEXT
+sasl.mechanism=SCRAM-SHA-512
+sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="connect" password="<CONNECT_PW>";
+
+# Les producteurs et consommateurs des tâches ne reprennent PAS la section ci-dessus : on la répète
+producer.security.protocol=SASL_PLAINTEXT
+producer.sasl.mechanism=SCRAM-SHA-512
+producer.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="connect" password="<CONNECT_PW>";
+consumer.security.protocol=SASL_PLAINTEXT
+consumer.sasl.mechanism=SCRAM-SHA-512
+consumer.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="connect" password="<CONNECT_PW>";
+admin.security.protocol=SASL_PLAINTEXT
+admin.sasl.mechanism=SCRAM-SHA-512
+admin.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="connect" password="<CONNECT_PW>";
+
+############ Cluster Connect ############
+group.id=connect-cdc
+config.storage.topic=connect-cdc-configs
+offset.storage.topic=connect-cdc-offsets
+status.storage.topic=connect-cdc-status
+config.storage.replication.factor=3
+offset.storage.replication.factor=3
+status.storage.replication.factor=3
+offset.flush.interval.ms=10000
+
+############ Format des messages (surchargeable par connecteur) ############
+key.converter=org.apache.kafka.connect.json.JsonConverter
+value.converter=org.apache.kafka.connect.json.JsonConverter
+key.converter.schemas.enable=false
+value.converter.schemas.enable=false
+
+############ Création des topics de données par Debezium ############
+topic.creation.enable=true
+
+############ Plugins ############
+plugin.path=/opt/kafka/plugins
+
+############ API REST ############
+listeners=http://0.0.0.0:8083
+rest.advertised.host.name=mcq-dbz70.cgi.credit-cgi.fr
+rest.advertised.port=8083
+rest.extension.classes=org.apache.kafka.connect.rest.basic.auth.extension.BasicAuthSecurityRestExtension
+EOF
+HOST=mcq-dbz70; sed -i "s/^rest.advertised.host.name=.*/rest.advertised.host.name=$HOST.cgi.credit-cgi.fr/" /etc/kafka/connect-distributed.properties
+read -rsp 'PW connect (SCRAM) : ' PW; echo; sed -i "s#<CONNECT_PW>#$PW#g" /etc/kafka/connect-distributed.properties; unset PW
+chown root:kafka /etc/kafka/connect-distributed.properties && chmod 640 /etc/kafka/connect-distributed.properties && grep -c '<CONNECT_PW>' /etc/kafka/connect-distributed.properties
+
+➡️ Le grep doit afficher 0.
+
+4.3 Authentification Basic de l’API REST
+
+Générez une fois deux mots de passe, identiques sur les 2 workers, et rangez-les dans votre coffre :
+
+for u in connect-admin akhq-connect; do echo "$u : $(openssl rand -base64 24)"; done
+
+Fichier JAAS :
+
+cat > /etc/kafka/connect-rest-jaas.conf <<'EOF'
+KafkaConnect {
+  org.apache.kafka.connect.rest.basic.auth.extension.PropertyFileLoginModule required
+  file="/etc/kafka/connect-rest-users.properties";
+};
+EOF
+
+Fichier des comptes, au format utilisateur: motdepasse :
+
+umask 027; read -rsp 'PW connect-admin : ' P1; echo; read -rsp 'PW akhq-connect : ' P2; echo; printf 'connect-admin: %s\nakhq-connect: %s\n' "$P1" "$P2" > /etc/kafka/connect-rest-users.properties; unset P1 P2
+
+Droits sur les fichiers :
+
+chown root:kafka /etc/kafka/connect-rest-*.{conf,properties} && chmod 640 /etc/kafka/connect-rest-users.properties && chmod 644 /etc/kafka/connect-rest-jaas.conf
+cp /opt/kafka/current/config/connect-log4j.properties /etc/kafka/ && chmod 644 /etc/kafka/connect-log4j.properties
+4.4 Unit systemd
+
+La heap est à 8 Go si la machine a 16 Go de RAM. Avec moins, mettez la moitié de la RAM disponible.
+
+cat > /etc/systemd/system/kafka-connect.service <<'EOF'
+[Unit]
+Description=Kafka Connect distributed worker (Debezium)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=kafka
+Group=kafka
+Environment=JAVA_HOME=/usr/lib/jvm/jre-21-openjdk
+Environment="KAFKA_HEAP_OPTS=-Xms8g -Xmx8g"
+Environment=LOG_DIR=/var/log/kafka
+Environment="KAFKA_LOG4J_OPTS=-Dlog4j.configuration=file:/etc/kafka/connect-log4j.properties"
+Environment="KAFKA_OPTS=-Djava.security.auth.login.config=/etc/kafka/connect-rest-jaas.conf"
+ExecStart=/opt/kafka/current/bin/connect-distributed.sh /etc/kafka/connect-distributed.properties
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=120
+SuccessExitStatus=143
+LimitNOFILE=100000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now kafka-connect
+4.5 Vérifications
+
+Sur chaque worker (le démarrage prend 30 à 60 secondes) :
+
+systemctl is-active kafka-connect; ss -ltn | grep -c ':8083'; ausearch -m avc -ts recent | grep -c denied
+grep -E 'ERROR|Joined group|Finished starting connectors and tasks' /var/log/kafka/connect.log | tail -5
+
+Depuis la toolbox, ou depuis n’importe quel poste du réseau :
+
+Accès sans identifiants, qui doit être refusé :
+
+curl -s -o /dev/null -w '%{http_code}\n' http://mcq-dbz70.cgi.credit-cgi.fr:8083/
+
+Version :
+
+read -rsp 'PW connect-admin : ' CA; echo; curl -s -u "connect-admin:$CA" http://mcq-dbz70.cgi.credit-cgi.fr:8083/
+
+Plugins chargés :
+
+curl -s -u "connect-admin:$CA" http://mcq-dbz71.cgi.credit-cgi.fr:8083/connector-plugins | grep -oE '"class":"[^"]+"'
+
+Les 2 workers doivent faire partie du même groupe connect-cdc :
+
+$K/kafka-consumer-groups.sh $ADM --describe --group connect-cdc --members 2>/dev/null | grep -c dbz
