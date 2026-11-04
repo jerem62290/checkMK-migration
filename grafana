@@ -1,0 +1,653 @@
+Vue d’ensemble
+Composant	Machine(s)	Port	Accès
+node_exporter	les 6	9100	réseau, métriques seules
+JMX exporter (agent Java)	dbk70-72	7071	réseau, métriques seules
+JMX exporter (agent Java)	dbz70-71	7072	réseau, métriques seules
+kafka_exporter	dbt70	9308	local uniquement (127.0.0.1)
+blackbox_exporter	dbt70	9115	local uniquement : il sonde toute adresse qu’on lui demande, l’exposer permettrait de l’utiliser pour scanner le réseau
+Prometheus	dbt70	9090	tous réseaux, avec authentification
+Alertmanager	dbt70	9093	tous réseaux, avec authentification
+Grafana	dbt70	3000	tous réseaux, avec authentification
+
+Les données de Prometheus, Alertmanager et Grafana vont dans /inte/vq/DAT/data/AKH. Prometheus garde 30 jours, avec un plafond de 20 Go.
+
+8.1 node_exporter (sur les 6 machines)
+useradd -r -M -s /sbin/nologin node_exporter
+tar -xzf /opt/bundle/artifacts/monitoring/node_exporter-1.12.1.linux-amd64.tar.gz -C /usr/local/bin --strip-components=1 --wildcards '*/node_exporter' && chown root:root /usr/local/bin/node_exporter && chmod 755 /usr/local/bin/node_exporter && restorecon -v /usr/local/bin/node_exporter
+
+Le collecteur systemd remonte l’état des services, ce qui permettra d’alerter si l’un d’eux tombe en échec. Dans le filtre, j’écris [.] plutôt que \., parce que systemd interprète les antislashs.
+
+cat > /etc/systemd/system/node_exporter.service <<'EOF'
+[Unit]
+Description=Prometheus node_exporter
+After=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+ExecStart=/usr/local/bin/node_exporter --web.listen-address=0.0.0.0:9100 --collector.systemd --collector.systemd.unit-include='(kafka|kafka-connect|akhq|prometheus|alertmanager|grafana-server|kafka_exporter|blackbox_exporter|node_exporter|chronyd)[.]service'
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now node_exporter
+curl -s localhost:9100/metrics | grep -c '^node_systemd_unit_state'
+
+➡️ Résultat attendu : un nombre supérieur à 0.
+
+8.2 JMX exporter (sur dbk70-72 et dbz70-71)
+a) Installer l’agent (sur les 5 machines)
+mkdir -p /opt/jmx_exporter /etc/jmx_exporter && cp /opt/bundle/artifacts/monitoring/jmx_prometheus_javaagent-1.6.0.jar /opt/jmx_exporter/ && chmod 755 /opt/jmx_exporter /etc/jmx_exporter && chmod 644 /opt/jmx_exporter/*.jar && restorecon -R /opt/jmx_exporter /etc/jmx_exporter
+b) Règles pour les brokers (sur dbk70-72)
+
+Ces règles transforment les métriques JMX de Kafka en noms Prometheus. Elles incluent les métriques du quorum KRaft (raft-metrics).
+
+cat > /etc/jmx_exporter/kafka-broker.yml <<'EOF'
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+rules:
+  # KRaft (quorum)
+  - pattern: 'kafka.server<type=raft-metrics><>([a-z-]+)'
+    name: kafka_server_raft_$1
+    type: GAUGE
+  # Cas particuliers
+  - pattern: 'kafka.server<type=(.+), name=(.+), clientId=(.+), topic=(.+), partition=(.*)><>Value'
+    name: kafka_server_$1_$2
+    type: GAUGE
+    labels: { clientId: "$3", topic: "$4", partition: "$5" }
+  - pattern: 'kafka.server<type=(.+), name=(.+), clientId=(.+), brokerHost=(.+), brokerPort=(.+)><>Value'
+    name: kafka_server_$1_$2
+    type: GAUGE
+    labels: { clientId: "$3", broker: "$4:$5" }
+  - pattern: 'kafka.coordinator.(\w+)<type=(.+), name=(.+)><>Value'
+    name: kafka_coordinator_$1_$2_$3
+    type: GAUGE
+  # Compteurs "PerSec"
+  - pattern: 'kafka.(\w+)<type=(.+), name=(.+)PerSec\w*, (.+)=(.+), (.+)=(.+)><>Count'
+    name: kafka_$1_$2_$3_total
+    type: COUNTER
+    labels: { "$4": "$5", "$6": "$7" }
+  - pattern: 'kafka.(\w+)<type=(.+), name=(.+)PerSec\w*, (.+)=(.+)><>Count'
+    name: kafka_$1_$2_$3_total
+    type: COUNTER
+    labels: { "$4": "$5" }
+  - pattern: 'kafka.(\w+)<type=(.+), name=(.+)PerSec\w*><>Count'
+    name: kafka_$1_$2_$3_total
+    type: COUNTER
+  # Jauges génériques
+  - pattern: 'kafka.(\w+)<type=(.+), name=(.+), (.+)=(.+), (.+)=(.+)><>Value'
+    name: kafka_$1_$2_$3
+    type: GAUGE
+    labels: { "$4": "$5", "$6": "$7" }
+  - pattern: 'kafka.(\w+)<type=(.+), name=(.+), (.+)=(.+)><>Value'
+    name: kafka_$1_$2_$3
+    type: GAUGE
+    labels: { "$4": "$5" }
+  - pattern: 'kafka.(\w+)<type=(.+), name=(.+)><>Value'
+    name: kafka_$1_$2_$3
+    type: GAUGE
+  # Histogrammes (latences des requêtes)
+  - pattern: 'kafka.(\w+)<type=(.+), name=(.+), (.+)=(.+), (.+)=(.+)><>Count'
+    name: kafka_$1_$2_$3_count
+    type: COUNTER
+    labels: { "$4": "$5", "$6": "$7" }
+  - pattern: 'kafka.(\w+)<type=(.+), name=(.+), (.+)=(.*), (.+)=(.+)><>(\d+)thPercentile'
+    name: kafka_$1_$2_$3
+    type: GAUGE
+    labels: { "$4": "$5", "$6": "$7", quantile: "0.$8" }
+  - pattern: 'kafka.(\w+)<type=(.+), name=(.+), (.+)=(.+)><>Count'
+    name: kafka_$1_$2_$3_count
+    type: COUNTER
+    labels: { "$4": "$5" }
+  - pattern: 'kafka.(\w+)<type=(.+), name=(.+), (.+)=(.*)><>(\d+)thPercentile'
+    name: kafka_$1_$2_$3
+    type: GAUGE
+    labels: { "$4": "$5", quantile: "0.$6" }
+  - pattern: 'kafka.(\w+)<type=(.+), name=(.+)><>Count'
+    name: kafka_$1_$2_$3_count
+    type: COUNTER
+  - pattern: 'kafka.(\w+)<type=(.+), name=(.+)><>(\d+)thPercentile'
+    name: kafka_$1_$2_$3
+    type: GAUGE
+    labels: { quantile: "0.$4" }
+EOF
+chmod 644 /etc/jmx_exporter/kafka-broker.yml
+
+On ajoute l’agent au service par un fichier complémentaire (drop-in), sans modifier l’unit d’origine :
+
+mkdir -p /etc/systemd/system/kafka.service.d && cat > /etc/systemd/system/kafka.service.d/jmx-exporter.conf <<'EOF'
+[Service]
+Environment="KAFKA_OPTS=-javaagent:/opt/jmx_exporter/jmx_prometheus_javaagent-1.6.0.jar=7071:/etc/jmx_exporter/kafka-broker.yml"
+EOF
+systemctl daemon-reload
+
+Redémarrage un broker à la fois, dans l’ordre dbk70, puis dbk71, puis dbk72 :
+
+systemctl restart kafka && sleep 30 && curl -s localhost:7071/metrics | grep -E '^kafka_server_replicamanager_underreplicatedpartitions|^kafka_server_raft_current_state'
+
+Avant de passer au broker suivant, vérifiez depuis la toolbox que toutes les partitions sont de nouveau répliquées. La commande ne doit rien afficher :
+
+$K/kafka-topics.sh $ADM --describe --under-replicated-partitions
+c) Règles pour Connect et Debezium (sur dbz70-71)
+cat > /etc/jmx_exporter/kafka-connect.yml <<'EOF'
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+rules:
+  # --- Debezium (PostgreSQL / Oracle) ---
+  - pattern: 'debezium.([^:]+)<type=connector-metrics, context=([^,]+), server=([^,]+), key=([^>]+)><>RowsScanned'
+    name: debezium_metrics_rowsscanned
+    labels: { plugin: "$1", context: "$2", name: "$3", table: "$4" }
+  - pattern: 'debezium.([^:]+)<type=connector-metrics, server=([^,]+), task=([^,]+), context=([^>]+)><>([^:]+)'
+    name: debezium_metrics_$5
+    labels: { plugin: "$1", name: "$2", task: "$3", context: "$4" }
+  - pattern: 'debezium.([^:]+)<type=connector-metrics, context=([^,]+), server=([^>,]+)><>([^:]+)'
+    name: debezium_metrics_$4
+    labels: { plugin: "$1", context: "$2", name: "$3" }
+  # --- Kafka Connect : statut des connecteurs et tâches (valeur texte -> 1) ---
+  - pattern: 'kafka.connect<type=connector-metrics, connector=(.+)><>status: ([a-z-]+)'
+    name: kafka_connect_connector_status
+    value: 1
+    labels: { connector: "$1", status: "$2" }
+  - pattern: 'kafka.connect<type=connector-task-metrics, connector=(.+), task=(.+)><>status: ([a-z-]+)'
+    name: kafka_connect_task_status
+    value: 1
+    labels: { connector: "$1", task: "$2", status: "$3" }
+  # --- Métriques des tâches ---
+  - pattern: 'kafka.connect<type=(.+)-metrics, connector=(.+), task=(.+)><>([a-z-]+)'
+    name: kafka_connect_$1_$4
+    labels: { connector: "$2", task: "$3" }
+  # --- Worker ---
+  - pattern: 'kafka.connect<type=connect-worker-metrics, connector=(.+)><>([a-z-]+)'
+    name: kafka_connect_worker_$2
+    labels: { connector: "$1" }
+  - pattern: 'kafka.connect<type=connect-worker-metrics><>([a-z-]+)'
+    name: kafka_connect_worker_$1
+  - pattern: 'kafka.connect<type=connect-worker-rebalance-metrics><>([a-z-]+)'
+    name: kafka_connect_worker_rebalance_$1
+  - pattern: 'kafka.connect<type=connect-coordinator-metrics, client-id=(.+)><>(assigned-connectors|assigned-tasks)'
+    name: kafka_connect_coordinator_$2
+    labels: { client_id: "$1" }
+EOF
+chmod 644 /etc/jmx_exporter/kafka-connect.yml
+
+Le drop-in redéfinit KAFKA_OPTS. Il doit donc reprendre l’option JAAS de l’API REST définie à l’étape 4 :
+
+mkdir -p /etc/systemd/system/kafka-connect.service.d && cat > /etc/systemd/system/kafka-connect.service.d/jmx-exporter.conf <<'EOF'
+[Service]
+Environment="KAFKA_OPTS=-Djava.security.auth.login.config=/etc/kafka/connect-rest-jaas.conf -javaagent:/opt/jmx_exporter/jmx_prometheus_javaagent-1.6.0.jar=7072:/etc/jmx_exporter/kafka-connect.yml"
+EOF
+systemctl daemon-reload && systemctl restart kafka-connect && sleep 45 && curl -s localhost:7072/metrics | grep -c '^kafka_connect_worker'
+
+➡️ Résultat attendu : un nombre supérieur à 0. Faites un worker après l’autre. Les métriques debezium_* n’apparaîtront qu’à l’étape 6, quand des connecteurs tourneront.
+
+8.3 Préparer la toolbox (dbt70)
+a) Binaires, comptes et répertoires
+cd /opt/bundle/artifacts/monitoring && tar -xzf prometheus-3.13.2.linux-amd64.tar.gz -C /usr/local/bin --strip-components=1 --wildcards '*/prometheus' '*/promtool' && tar -xzf alertmanager-0.34.0.linux-amd64.tar.gz -C /usr/local/bin --strip-components=1 --wildcards '*/alertmanager' '*/amtool' && tar -xzf kafka_exporter-1.9.0.linux-amd64.tar.gz -C /usr/local/bin --strip-components=1 --wildcards '*/kafka_exporter' && tar -xzf blackbox_exporter-0.28.0.linux-amd64.tar.gz -C /usr/local/bin --strip-components=1 --wildcards '*/blackbox_exporter'
+cd /usr/local/bin && chown root:root prometheus promtool alertmanager amtool kafka_exporter blackbox_exporter && chmod 755 prometheus promtool alertmanager amtool kafka_exporter blackbox_exporter && restorecon -v prometheus promtool alertmanager amtool kafka_exporter blackbox_exporter
+for u in prometheus alertmanager exporter; do useradd -r -M -s /sbin/nologin $u; done
+mkdir -p /inte/vq/DAT/data/AKH/{prometheus,alertmanager,grafana} /etc/prometheus/{rules,secrets} /etc/alertmanager /etc/blackbox_exporter && chown prometheus:prometheus /inte/vq/DAT/data/AKH/prometheus && chown alertmanager:alertmanager /inte/vq/DAT/data/AKH/alertmanager && chmod 755 /inte/vq/DAT/data/AKH
+semanage fcontext -a -t var_lib_t '/inte/vq/DAT/data/AKH(/.*)?' && restorecon -Rv /inte/vq/DAT/data/AKH
+b) Outil de hachage bcrypt
+
+Prometheus et Alertmanager n’acceptent que des mots de passe hachés en bcrypt. htpasswd sert à les générer :
+
+dnf install -y httpd-tools
+c) Secrets à préparer et à ranger dans votre coffre
+Secret	Utilisation
+admin Prometheus	interface web, et collecte par Prometheus de ses propres métriques
+grafana Prometheus	source de données Grafana
+admin Alertmanager	interface web
+prometheus Alertmanager	envoi des alertes de Prometheus vers Alertmanager
+kexporter	créé à l’étape 3.1
+admin Grafana	interface web
+8.4 kafka_exporter (dbt70)
+
+Ce composant calcule le retard des consommateurs (lag) et compte les brokers vus.
+
+read -rsp 'PW kexporter (SCRAM) : ' P; echo; umask 077; printf 'KEXP_PW=%s\n' "$P" > /etc/sysconfig/kafka_exporter; unset P; chown root:exporter /etc/sysconfig/kafka_exporter; chmod 640 /etc/sysconfig/kafka_exporter
+cat > /etc/systemd/system/kafka_exporter.service <<'EOF'
+[Unit]
+Description=Prometheus kafka_exporter
+After=network-online.target
+
+[Service]
+User=exporter
+Group=exporter
+EnvironmentFile=/etc/sysconfig/kafka_exporter
+ExecStart=/usr/local/bin/kafka_exporter \
+  --kafka.server=mcq-dbk70.cgi.credit-cgi.fr:9092 \
+  --kafka.server=mcq-dbk71.cgi.credit-cgi.fr:9092 \
+  --kafka.server=mcq-dbk72.cgi.credit-cgi.fr:9092 \
+  --kafka.version=3.6.0 \
+  --sasl.enabled --sasl.mechanism=scram-sha512 \
+  --sasl.username=kexporter --sasl.password=${KEXP_PW} \
+  --web.listen-address=127.0.0.1:9308
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now kafka_exporter && sleep 10 && curl -s 127.0.0.1:9308/metrics | grep '^kafka_brokers'
+
+➡️ Résultat attendu : kafka_brokers 3.
+
+--kafka.version donne la version du protocole utilisée par le client de l’exporter. 3.6.0 est compatible avec vos brokers.
+
+Le mot de passe apparaît dans la ligne de commande du processus, visible avec ps par les utilisateurs locaux de la toolbox. C’est acceptable si seuls les administrateurs ont un compte sur dbt70. Sinon, dites-le-moi.
+
+8.5 blackbox_exporter (dbt70)
+
+Ce composant vérifie que les services répondent, vus de l’extérieur. Pour Connect, Prometheus et Alertmanager, une réponse 401 (authentification demandée) prouve que le service est en ligne.
+
+cat > /etc/blackbox_exporter/blackbox.yml <<'EOF'
+modules:
+  tcp_connect:
+    prober: tcp
+    timeout: 5s
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      preferred_ip_protocol: ip4
+  http_401:
+    prober: http
+    timeout: 5s
+    http:
+      preferred_ip_protocol: ip4
+      valid_status_codes: [401]
+EOF
+chmod 755 /etc/blackbox_exporter && chmod 644 /etc/blackbox_exporter/blackbox.yml
+cat > /etc/systemd/system/blackbox_exporter.service <<'EOF'
+[Unit]
+Description=Prometheus blackbox_exporter
+After=network-online.target
+
+[Service]
+User=exporter
+Group=exporter
+ExecStart=/usr/local/bin/blackbox_exporter --config.file=/etc/blackbox_exporter/blackbox.yml --web.listen-address=127.0.0.1:9115
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now blackbox_exporter && curl -s '127.0.0.1:9115/probe?module=tcp_connect&target=mcq-dbk70.cgi.credit-cgi.fr:9092' | grep '^probe_success'
+
+➡️ Résultat attendu : probe_success 1.
+
+8.6 Alertmanager (dbt70)
+
+Vous n’avez pas encore de destinataire pour les alertes (SMTP ou webhook). Pour l’instant, elles seront visibles dans l’interface d’Alertmanager sans être envoyées. On ajoutera un destinataire plus tard sans rien changer d’autre.
+
+Authentification. htpasswd demande chaque mot de passe deux fois :
+
+umask 027; { echo "basic_auth_users:"; for u in admin prometheus; do echo "  $u: $(htpasswd -nBC 10 $u | cut -d: -f2)"; done; } > /etc/alertmanager/web.yml
+
+Configuration.
+
+cat > /etc/alertmanager/alertmanager.yml <<'EOF'
+route:
+  receiver: "aucun"
+  group_by: ["alertname", "host"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+receivers:
+  - name: "aucun"
+EOF
+chown -R root:alertmanager /etc/alertmanager && chmod 750 /etc/alertmanager && chmod 640 /etc/alertmanager/*.yml && amtool check-config /etc/alertmanager/alertmanager.yml
+
+Unit systemd. --cluster.listen-address= (valeur vide) désactive le mode cluster, inutile avec une seule instance. Le port 9094 ne s’ouvre donc pas.
+
+cat > /etc/systemd/system/alertmanager.service <<'EOF'
+[Unit]
+Description=Prometheus Alertmanager
+After=network-online.target
+
+[Service]
+User=alertmanager
+Group=alertmanager
+ExecStart=/usr/local/bin/alertmanager --config.file=/etc/alertmanager/alertmanager.yml --web.config.file=/etc/alertmanager/web.yml --storage.path=/inte/vq/DAT/data/AKH/alertmanager --web.listen-address=0.0.0.0:9093 --cluster.listen-address= --web.external-url=http://mcq-dbt70.cgi.credit-cgi.fr:9093/
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now alertmanager
+8.7 Prometheus (dbt70)
+a) Authentification et fichiers de mots de passe
+umask 027; { echo "basic_auth_users:"; for u in admin grafana; do echo "  $u: $(htpasswd -nBC 10 $u | cut -d: -f2)"; done; } > /etc/prometheus/web.yml
+
+Prometheus a besoin de deux mots de passe en clair : le sien, pour collecter ses propres métriques, et celui du compte prometheus d’Alertmanager.
+
+read -rsp 'PW admin Prometheus : ' P; echo; printf '%s' "$P" > /etc/prometheus/secrets/prometheus-admin.pw; read -rsp 'PW prometheus (Alertmanager) : ' P; echo; printf '%s' "$P" > /etc/prometheus/secrets/alertmanager.pw; unset P
+b) Configuration
+cat > /etc/prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["localhost:9093"]
+      basic_auth:
+        username: prometheus
+        password_file: /etc/prometheus/secrets/alertmanager.pw
+
+scrape_configs:
+  - job_name: prometheus
+    basic_auth: { username: admin, password_file: /etc/prometheus/secrets/prometheus-admin.pw }
+    static_configs: [ { targets: ["localhost:9090"] } ]
+
+  - job_name: alertmanager
+    basic_auth: { username: prometheus, password_file: /etc/prometheus/secrets/alertmanager.pw }
+    static_configs: [ { targets: ["localhost:9093"] } ]
+
+  - job_name: node
+    static_configs:
+      - targets:
+          - mcq-dbk70.cgi.credit-cgi.fr:9100
+          - mcq-dbk71.cgi.credit-cgi.fr:9100
+          - mcq-dbk72.cgi.credit-cgi.fr:9100
+          - mcq-dbz70.cgi.credit-cgi.fr:9100
+          - mcq-dbz71.cgi.credit-cgi.fr:9100
+          - mcq-dbt70.cgi.credit-cgi.fr:9100
+    relabel_configs:
+      - { source_labels: [__address__], regex: '([^.:]+).*', target_label: host }
+
+  - job_name: kafka-broker
+    static_configs:
+      - targets:
+          - mcq-dbk70.cgi.credit-cgi.fr:7071
+          - mcq-dbk71.cgi.credit-cgi.fr:7071
+          - mcq-dbk72.cgi.credit-cgi.fr:7071
+    relabel_configs:
+      - { source_labels: [__address__], regex: '([^.:]+).*', target_label: host }
+
+  - job_name: kafka-connect
+    static_configs:
+      - targets:
+          - mcq-dbz70.cgi.credit-cgi.fr:7072
+          - mcq-dbz71.cgi.credit-cgi.fr:7072
+    relabel_configs:
+      - { source_labels: [__address__], regex: '([^.:]+).*', target_label: host }
+
+  - job_name: kafka-exporter
+    static_configs: [ { targets: ["127.0.0.1:9308"] } ]
+
+  - job_name: akhq
+    metrics_path: /prometheus
+    static_configs: [ { targets: ["localhost:28081"] } ]
+
+  - job_name: grafana
+    static_configs: [ { targets: ["localhost:3000"] } ]
+
+  - job_name: blackbox-exporter
+    static_configs: [ { targets: ["127.0.0.1:9115"] } ]
+
+  - job_name: sonde-tcp
+    metrics_path: /probe
+    params: { module: [tcp_connect] }
+    static_configs:
+      - targets:
+          - mcq-dbk70.cgi.credit-cgi.fr:9092
+          - mcq-dbk71.cgi.credit-cgi.fr:9092
+          - mcq-dbk72.cgi.credit-cgi.fr:9092
+          - mcq-dbk70.cgi.credit-cgi.fr:9093
+          - mcq-dbk71.cgi.credit-cgi.fr:9093
+          - mcq-dbk72.cgi.credit-cgi.fr:9093
+    relabel_configs: &blackbox
+      - { source_labels: [__address__], target_label: __param_target }
+      - { source_labels: [__param_target], target_label: instance }
+      - { target_label: __address__, replacement: "127.0.0.1:9115" }
+
+  - job_name: sonde-http-auth
+    metrics_path: /probe
+    params: { module: [http_401] }
+    static_configs:
+      - targets:
+          - http://mcq-dbz70.cgi.credit-cgi.fr:8083/
+          - http://mcq-dbz71.cgi.credit-cgi.fr:8083/
+          - http://mcq-dbt70.cgi.credit-cgi.fr:9090/
+          - http://mcq-dbt70.cgi.credit-cgi.fr:9093/
+    relabel_configs: *blackbox
+
+  - job_name: sonde-http
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs:
+      - targets:
+          - http://mcq-dbt70.cgi.credit-cgi.fr:8080/
+          - http://mcq-dbt70.cgi.credit-cgi.fr:3000/api/health
+    relabel_configs: *blackbox
+EOF
+c) Règles d’alerte
+cat > /etc/prometheus/rules/kafka-cdc.yml <<'EOF'
+groups:
+  - name: infra
+    rules:
+      - alert: CibleInjoignable
+        expr: up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "{{ $labels.job }} injoignable : {{ $labels.instance }}" }
+      - alert: ServiceEnEchec
+        expr: node_systemd_unit_state{state="failed"} == 1
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "Service {{ $labels.name }} en échec sur {{ $labels.host }}" }
+      - alert: SondeEnEchec
+        expr: probe_success == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "Sonde KO : {{ $labels.instance }}" }
+      - alert: FSKafkaPlein80
+        expr: node_filesystem_avail_bytes{mountpoint="/inte/vq/DAT/data/KFK"} / node_filesystem_size_bytes{mountpoint="/inte/vq/DAT/data/KFK"} < 0.20
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "FS Kafka > 80% sur {{ $labels.host }}" }
+      - alert: FSKafkaPlein90
+        expr: node_filesystem_avail_bytes{mountpoint="/inte/vq/DAT/data/KFK"} / node_filesystem_size_bytes{mountpoint="/inte/vq/DAT/data/KFK"} < 0.10
+        for: 5m
+        labels: { severity: critical }
+        annotations: { summary: "FS Kafka > 90% sur {{ $labels.host }}" }
+      - alert: FSPresquePlein
+        expr: node_filesystem_avail_bytes{fstype=~"xfs|ext4",mountpoint!="/inte/vq/DAT/data/KFK"} / node_filesystem_size_bytes{fstype=~"xfs|ext4",mountpoint!="/inte/vq/DAT/data/KFK"} < 0.10
+        for: 15m
+        labels: { severity: warning }
+        annotations: { summary: "FS {{ $labels.mountpoint }} > 90% sur {{ $labels.host }}" }
+
+  - name: kafka
+    rules:
+      - alert: KafkaPartitionsSousRepliquees
+        expr: kafka_server_replicamanager_underreplicatedpartitions > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $value }} partition(s) sous-répliquée(s) sur {{ $labels.host }}" }
+      - alert: KafkaSousMinIsr
+        expr: kafka_server_replicamanager_underminisrpartitioncount > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "Partitions sous min.insync.replicas sur {{ $labels.host }} : écritures bloquées" }
+      - alert: KafkaPartitionsHorsLigne
+        expr: max(kafka_controller_kafkacontroller_offlinepartitionscount) > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "Partitions hors ligne" }
+      - alert: KafkaControllerActif
+        expr: sum(kafka_controller_kafkacontroller_activecontrollercount) != 1
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "Nombre de controllers actifs différent de 1" }
+      - alert: KafkaBrokersManquants
+        expr: kafka_brokers < 3
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "Seulement {{ $value }} broker(s) dans le cluster" }
+
+  - name: connect-debezium
+    rules:
+      - alert: ConnecteurEnEchec
+        expr: kafka_connect_connector_status{status="failed"} == 1
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "Connecteur {{ $labels.connector }} en échec" }
+      - alert: TacheEnEchec
+        expr: kafka_connect_task_status{status="failed"} == 1
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "Tâche {{ $labels.task }} du connecteur {{ $labels.connector }} en échec" }
+      - alert: DebeziumDeconnecte
+        expr: debezium_metrics_connected{context="streaming"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "Debezium {{ $labels.name }} déconnecté de la base" }
+      - alert: DebeziumRetard
+        expr: debezium_metrics_millisecondsbehindsource{context="streaming"} > 300000
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "Debezium {{ $labels.name }} a plus de 5 min de retard" }
+      - alert: ConsommateurEnRetard
+        expr: sum by (consumergroup, topic) (kafka_consumergroup_lag) > 100000
+        for: 15m
+        labels: { severity: warning }
+        annotations: { summary: "Groupe {{ $labels.consumergroup }} en retard sur {{ $labels.topic }} ({{ $value }} messages)" }
+EOF
+
+Le seuil de ConsommateurEnRetard, fixé à 100 000 messages, est provisoire. On l’ajustera quand on connaîtra les volumes.
+
+d) Droits et contrôle de la configuration
+chown -R root:prometheus /etc/prometheus && chmod 750 /etc/prometheus /etc/prometheus/rules /etc/prometheus/secrets && chmod 640 /etc/prometheus/*.yml /etc/prometheus/rules/*.yml /etc/prometheus/secrets/*
+promtool check config /etc/prometheus/prometheus.yml && promtool check web-config /etc/prometheus/web.yml
+
+➡️ Résultat attendu : SUCCESS pour la configuration, pour les règles et pour web.yml.
+
+e) Unit systemd
+cat > /etc/systemd/system/prometheus.service <<'EOF'
+[Unit]
+Description=Prometheus
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --web.config.file=/etc/prometheus/web.yml \
+  --storage.tsdb.path=/inte/vq/DAT/data/AKH/prometheus \
+  --storage.tsdb.retention.time=30d \
+  --storage.tsdb.retention.size=20GB \
+  --web.listen-address=0.0.0.0:9090 \
+  --web.external-url=http://mcq-dbt70.cgi.credit-cgi.fr:9090/
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now prometheus
+8.8 Grafana (dbt70)
+dnf install -y /opt/bundle/artifacts/monitoring/grafana_13.2.0_32077357341_linux_amd64.rpm
+
+Données sur le FS AKH, et désactivation des appels Internet. Votre installation est hors ligne : sans ces réglages, Grafana chercherait à contacter grafana.com et remplirait ses logs d’erreurs.
+
+chown grafana:grafana /inte/vq/DAT/data/AKH/grafana && sed -i 's#^DATA_DIR=.*#DATA_DIR=/inte/vq/DAT/data/AKH/grafana#' /etc/sysconfig/grafana-server
+cat >> /etc/sysconfig/grafana-server <<'EOF'
+GF_ANALYTICS_REPORTING_ENABLED=false
+GF_ANALYTICS_CHECK_FOR_UPDATES=false
+GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false
+GF_NEWS_NEWS_FEED_ENABLED=false
+GF_USERS_ALLOW_SIGN_UP=false
+EOF
+
+Mot de passe admin. Il n’est pris en compte qu’au premier démarrage. On le retire du fichier juste après, à la fin de cette section.
+
+read -rsp 'PW admin Grafana : ' P; echo; printf 'GF_SECURITY_ADMIN_PASSWORD=%s\n' "$P" >> /etc/sysconfig/grafana-server; unset P; chmod 640 /etc/sysconfig/grafana-server; chown root:grafana /etc/sysconfig/grafana-server
+
+Source de données Prometheus, déclarée par fichier (provisioning) :
+
+read -rsp 'PW grafana (Prometheus) : ' P; echo; umask 027; cat > /etc/grafana/provisioning/datasources/prometheus.yml <<EOF
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://localhost:9090
+    isDefault: true
+    basicAuth: true
+    basicAuthUser: grafana
+    secureJsonData:
+      basicAuthPassword: "$P"
+EOF
+unset P; chown root:grafana /etc/grafana/provisioning/datasources/prometheus.yml; chmod 640 /etc/grafana/provisioning/datasources/prometheus.yml
+
+Répertoire pour les tableaux de bord (fichiers JSON déposés à la main) :
+
+mkdir -p /etc/grafana/dashboards && chmod 755 /etc/grafana/dashboards && cat > /etc/grafana/provisioning/dashboards/fichiers.yml <<'EOF'
+apiVersion: 1
+providers:
+  - name: fichiers
+    folder: Kafka-CDC
+    type: file
+    options:
+      path: /etc/grafana/dashboards
+EOF
+chown root:grafana /etc/grafana/provisioning/dashboards/fichiers.yml && chmod 640 /etc/grafana/provisioning/dashboards/fichiers.yml
+
+Démarrage, puis retrait du mot de passe admin du fichier :
+
+systemctl daemon-reload && systemctl enable --now grafana-server && sleep 20 && curl -s localhost:3000/api/health
+sed -i '/^GF_SECURITY_ADMIN_PASSWORD=/d' /etc/sysconfig/grafana-server
+
+📊 Tableaux de bord. En mode hors ligne, l’import depuis grafana.com est impossible. Deux possibilités :
+
+ajouter au bundle les fichiers JSON des tableaux publics, téléchargés depuis votre poste connecté : 1860 (Node Exporter Full) et 7589 (Kafka Exporter Overview) fonctionnent tels quels avec cette configuration ;
+me laisser construire, après l’étape 6, un tableau Kafka-CDC adapté à nos noms de métriques : brokers, quorum, Connect, retard de Debezium et lag des consommateurs.
+
+Je recommande de faire les deux.
+
+8.9 Vérifications finales
+
+Sur dbt70 :
+
+for s in kafka_exporter blackbox_exporter alertmanager prometheus grafana-server; do printf '%-20s %s\n' $s $(systemctl is-active $s); done; ausearch -m avc -ts today | grep -c denied
+
+État de toutes les cibles collectées par Prometheus. La commande affiche le nombre de cibles par état :
+
+read -rsp 'PW admin Prometheus : ' P; echo; curl -s -u "admin:$P" localhost:9090/api/v1/targets | grep -o '"health":"[a-z]*"' | sort | uniq -c; unset P
+
+➡️ Résultat attendu : 27 cibles en "health":"up" et aucune en down.
+
+Dans le navigateur :
+
+URL	Test
+http://mcq-dbt70.cgi.credit-cgi.fr:9090	La page demande des identifiants. Avec admin, Status > Targets est entièrement vert et Alerts montre les règles en inactive.
+http://mcq-dbt70.cgi.credit-cgi.fr:9093	La page demande des identifiants. Avec admin, l’interface d’Alertmanager s’affiche.
+http://mcq-dbt70.cgi.credit-cgi.fr:3000	Connexion avec admin et le mot de passe choisi. Connections > Data sources > Prometheus > Test doit être OK. Dans Explore, la requête kafka_brokers doit renvoyer 3.
+✅ Ce que j’attends en retour
+
+Pour l’étape 7, les points listés dans mon message précédent :
+
+version de Java 25 et contexte bin_t ;
+état d’AKHQ : active, ports 8080 et 28081 en écoute, /health à UP ;
+résultats des tests navigateur 1 à 5.
+
+Pour l’étape 8 :
+
+8.1 : node_exporter actif sur les 6 machines ?
+8.2 : métriques présentes sur les ports 7071 et 7072, et aucune partition sous-répliquée entre deux redémarrages de brokers ?
+8.4 et 8.5 : kafka_brokers 3 et probe_success 1 ?
+8.7d : SUCCESS pour la configuration Prometheus ?
+8.9 : nombre de cibles up et down, nombre de refus SELinux, et résultat des tests navigateur.
+
+En cas d’erreur, la première ligne error ou ERROR de journalctl -u <service> -n 30.
