@@ -1,0 +1,177 @@
+Mise en place d’un flux Oracle XStream côté Kafka
+
+Les exemples reprennent les valeurs du tableau D. Remplacez-les par celles fournies par les DBA :
+
+Information des DBA	Valeur d’exemple
+Listener	ora-fact.cgi.credit-cgi.fr:1521
+CDB / PDB	ORCLCDB / ORCLPDB1
+Serveur sortant	DBZXOUT_FACT
+Compte	c##dbzuser
+Tables	SCH1.CLIENT, SCH1.CONTRAT
+Snapshot initial	oui
+
+Nom du connecteur : ora-fact.
+
+Étape	Où	Fréquence
+K1. Activer le coffre de secrets de Connect	dbz70 et dbz71	une seule fois
+K2. Déposer les secrets du flux	dbz70 et dbz71	par flux
+K3. Créer le topic d’historique de schéma	toolbox	par flux
+K4. Écrire la configuration du connecteur	toolbox	par flux
+K5. Valider puis créer le connecteur	toolbox	par flux
+K6. Vérifier le snapshot puis le flux continu	toolbox + DBA	par flux
+K7. Ouvrir l’accès aux consommateurs	toolbox	par application
+K1. Activer le coffre de secrets (une seule fois, sur dbz70 puis dbz71)
+
+Sans cette étape, le mot de passe Oracle serait stocké en clair dans le topic connect-cdc-configs, lisible depuis AKHQ. Le FileConfigProvider remplace dans la configuration une référence ${file:...} par le contenu d’un fichier local. Le topic ne contient alors que la référence.
+
+mkdir -p /etc/kafka/secrets && chown root:kafka /etc/kafka/secrets && chmod 750 /etc/kafka/secrets
+cat >> /etc/kafka/connect-distributed.properties <<'EOF'
+
+############ Secrets (références ${file:...}) ############
+config.providers=file
+config.providers.file.class=org.apache.kafka.common.config.provider.FileConfigProvider
+config.providers.file.param.allowed.paths=/etc/kafka/secrets
+EOF
+
+La ligne allowed.paths empêche un connecteur de lire un autre fichier que ceux de /etc/kafka/secrets.
+
+Secret Kafka partagé par tous les flux. Debezium a son propre client Kafka pour l’historique de schéma, et ce client a besoin du mot de passe SCRAM du compte connect :
+
+read -rsp 'PW connect (SCRAM Kafka) : ' P; echo; umask 027; printf 'sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="connect" password="%s";\n' "$P" > /etc/kafka/secrets/kafka-connect.properties; unset P; chown root:kafka /etc/kafka/secrets/kafka-connect.properties; chmod 640 /etc/kafka/secrets/kafka-connect.properties
+
+Redémarrez un worker à la fois :
+
+systemctl restart kafka-connect && sleep 45 && systemctl is-active kafka-connect && grep -c ERROR /var/log/kafka/connect.log
+K2. Déposer les secrets du flux (sur dbz70 et dbz71)
+
+Le connecteur peut tourner sur l’un ou l’autre worker : le fichier doit exister sur les deux.
+
+read -rsp 'PW Oracle c##dbzuser : ' P; echo; umask 027; printf 'password=%s\n' "$P" > /etc/kafka/secrets/ora-fact.properties; unset P; chown root:kafka /etc/kafka/secrets/ora-fact.properties; chmod 640 /etc/kafka/secrets/ora-fact.properties
+
+Vérifiez aussi que le worker joint le listener Oracle :
+
+timeout 5 bash -c '</dev/tcp/ora-fact.cgi.credit-cgi.fr/1521' && echo LISTENER_OK
+K3. Créer le topic d’historique de schéma (toolbox)
+
+Ce topic garde la structure des tables, c’est-à-dire tous les DDL. Il doit avoir une seule partition et une rétention infinie : s’il perd des messages, le connecteur ne peut plus redémarrer.
+
+export JAVA_HOME=/usr/lib/jvm/jre-21-openjdk K=/opt/kafka/current/bin BS=mcq-dbk70.cgi.credit-cgi.fr:9092
+ADM="--bootstrap-server $BS --command-config /root/kafka-admin.properties"
+$K/kafka-topics.sh $ADM --create --topic cdc.schemahistory.ora-fact --partitions 1 --replication-factor 3 --config retention.ms=-1 --config retention.bytes=-1
+
+Les topics de données (cdc.ora.FACT.SCH1.CLIENT, etc.) et le topic heartbeat seront créés automatiquement par le connecteur. Les ACLs de l’étape 3 couvrent déjà le préfixe cdc..
+
+K4. Configuration du connecteur (toolbox)
+
+Le fichier ne contient aucun mot de passe, seulement des références :
+
+mkdir -p /root/connectors && cat > /root/connectors/ora-fact.json <<'EOF'
+{
+  "connector.class": "io.debezium.connector.oracle.OracleConnector",
+  "tasks.max": "1",
+
+  "database.connection.adapter": "xstream",
+  "database.hostname": "ora-fact.cgi.credit-cgi.fr",
+  "database.port": "1521",
+  "database.user": "c##dbzuser",
+  "database.password": "${file:/etc/kafka/secrets/ora-fact.properties:password}",
+  "database.dbname": "ORCLCDB",
+  "database.pdb.name": "ORCLPDB1",
+  "database.out.server.name": "DBZXOUT_FACT",
+
+  "topic.prefix": "cdc.ora.FACT",
+  "table.include.list": "SCH1.CLIENT,SCH1.CONTRAT",
+  "snapshot.mode": "initial",
+  "decimal.handling.mode": "string",
+  "heartbeat.interval.ms": "60000",
+
+  "schema.history.internal.kafka.topic": "cdc.schemahistory.ora-fact",
+  "schema.history.internal.kafka.bootstrap.servers": "mcq-dbk70.cgi.credit-cgi.fr:9092,mcq-dbk71.cgi.credit-cgi.fr:9092,mcq-dbk72.cgi.credit-cgi.fr:9092",
+  "schema.history.internal.store.only.captured.tables.ddl": "true",
+  "schema.history.internal.producer.security.protocol": "SASL_PLAINTEXT",
+  "schema.history.internal.producer.sasl.mechanism": "SCRAM-SHA-512",
+  "schema.history.internal.producer.sasl.jaas.config": "${file:/etc/kafka/secrets/kafka-connect.properties:sasl.jaas.config}",
+  "schema.history.internal.consumer.security.protocol": "SASL_PLAINTEXT",
+  "schema.history.internal.consumer.sasl.mechanism": "SCRAM-SHA-512",
+  "schema.history.internal.consumer.sasl.jaas.config": "${file:/etc/kafka/secrets/kafka-connect.properties:sasl.jaas.config}",
+
+  "topic.creation.default.replication.factor": "3",
+  "topic.creation.default.partitions": "1",
+  "topic.creation.default.cleanup.policy": "delete",
+  "topic.creation.default.retention.ms": "604800000"
+}
+EOF
+chmod 600 /root/connectors/ora-fact.json
+
+Les paramètres à adapter :
+
+Paramètre	Valeur	Raison
+snapshot.mode	initial : copie complète, puis flux continu. no_data : flux continu seul	no_data convient si les cibles sont déjà chargées, par exemple par GoldenGate
+topic.prefix	cdc.ora.FACT	donne les topics cdc.ora.FACT.SCH1.CLIENT, conformes à la convention de nommage
+decimal.handling.mode	string	les NUMBER arrivent lisibles en JSON, au lieu d’octets encodés
+topic.creation.default.partitions	1	ordre strict de toutes les modifications d’une table. Plus de partitions donnent du parallélisme aux consommateurs, avec un ordre garanti seulement par clé primaire
+heartbeat.interval.ms	60 s	fait avancer la position même sur une table sans activité
+K5. Valider, puis créer le connecteur (toolbox)
+read -rsp 'PW connect-admin : ' CA; echo; CON=http://mcq-dbz70.cgi.credit-cgi.fr:8083
+
+Validation, sans rien créer :
+
+curl -s -u "connect-admin:$CA" -X PUT -H 'Content-Type: application/json' --data @/root/connectors/ora-fact.json "$CON/connector-plugins/io.debezium.connector.oracle.OracleConnector/config/validate" | grep -oE '"error_count":[0-9]+'
+
+➡️ Résultat attendu : "error_count":0.
+
+Sinon, affichez les messages d’erreur :
+
+curl -s -u "connect-admin:$CA" -X PUT -H 'Content-Type: application/json' --data @/root/connectors/ora-fact.json "$CON/connector-plugins/io.debezium.connector.oracle.OracleConnector/config/validate" | grep -oE '"errors":\["[^]]+'
+
+Création :
+
+curl -s -u "connect-admin:$CA" -X PUT -H 'Content-Type: application/json' --data @/root/connectors/ora-fact.json "$CON/connectors/ora-fact/config"
+K6. Vérifier
+
+1. État du connecteur et de sa tâche
+
+curl -s -u "connect-admin:$CA" "$CON/connectors/ora-fact/status"
+
+➡️ Résultat attendu : "state":"RUNNING" pour le connecteur et pour la tâche 0. Si l’état est FAILED, le champ trace donne la cause.
+
+2. Logs du worker qui porte la tâche. Le champ worker_id du statut indique lequel. Sur ce worker :
+
+grep -iE 'snapshot|streaming|xstream|ERROR' /var/log/kafka/connect.log | tail -15
+
+On doit voir la fin du snapshot, puis le démarrage du streaming.
+
+Erreurs fréquentes :
+
+Message	Cause
+UnsatisfiedLinkError / Incompatible version	Instant Client et ojdbc11 de versions différentes, ou LD_LIBRARY_PATH absent
+ORA-01031 / ORA-00942	droits manquants côté Oracle : à voir avec les DBA
+ORA-26701 ou erreur sur le serveur sortant	nom de serveur sortant erroné, ou connect_user non rattaché
+
+3. Topics créés
+
+$K/kafka-topics.sh $ADM --list | grep '^cdc.ora.FACT'
+
+4. Les messages arrivent-ils ?
+
+$K/kafka-console-consumer.sh --bootstrap-server $BS --consumer.config /root/kafka-admin.properties --topic cdc.ora.FACT.SCH1.CLIENT --from-beginning --max-messages 3 --property print.key=true
+
+5. Test de bout en bout. Demandez aux DBA de faire un UPDATE sur une ligne de test, suivi d’un COMMIT. Relancez la commande précédente sans --from-beginning : le message doit arriver avec "op":"u" en quelques secondes.
+
+6. Supervision. Dans Grafana, onglet Explore, la requête debezium_metrics_millisecondsbehindsource{name="cdc.ora.FACT"} doit afficher une valeur faible, et les alertes Debezium doivent être en inactive dans Prometheus.
+
+K7. Ouvrir l’accès à un consommateur (toolbox)
+
+Pour une application qui doit lire ce flux :
+
+read -rsp 'PW app-facturation : ' PW; echo; $K/kafka-configs.sh $ADM --alter --entity-type users --entity-name app-facturation --add-config "SCRAM-SHA-512=[iterations=8192,password=$PW]"; unset PW
+$K/kafka-acls.sh $ADM --add --allow-principal User:app-facturation --operation Read --operation Describe --topic cdc.ora.FACT. --resource-pattern-type prefixed
+$K/kafka-acls.sh $ADM --add --allow-principal User:app-facturation --operation Read --group app-facturation --resource-pattern-type prefixed
+
+La configuration client à transmettre à l’équipe est dans le guide d’utilisation (section « Kafka : comptes et ACLs »).
+
+Opérations courantes sur ce flux
+Besoin	Action
+Ajouter une table	Les DBA l’ajoutent au serveur sortant et activent son supplemental logging. Vous ajoutez la table à table.include.list, puis relancez le PUT .../connectors/ora-fact/config
+Maintenance de la base	PUT .../connectors/ora-fact/pause, puis /resume : la position est conservée
+Supprimer le flux	DELETE .../connectors/ora-fact. Ensuite, les DBA suppriment le serveur sortant avec DBMS_XSTREAM_ADM.DROP_OUTBOUND, sinon il continue de retenir des archives côté Oracle
